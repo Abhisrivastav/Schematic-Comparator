@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit
+.env
+*.pem
+*.key
+
+# Uploaded PDFs and session data (runtime only)
+uploads/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Helper/test scripts
+test_*.py
+push_to_github.bat
