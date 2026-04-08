@@ -712,6 +712,102 @@ def download_report():
                      download_name=fname, mimetype="text/html")
 
 
+def _build_chat_context(sdir: str) -> str:
+    """
+    Build a rich, structured system-prompt context from all available
+    session data: extracted ref/cust signal lists + full comparison detail.
+    Avoids hard mid-JSON truncation by serialising each interface separately
+    and stopping cleanly when we approach the token budget.
+    """
+    ref_content  = load_json(os.path.join(sdir, "ref_content.json"))
+    cust_content = load_json(os.path.join(sdir, "cust_content.json"))
+    comparison   = load_json(os.path.join(sdir, "comparison.json"))
+
+    MAX_CHARS = 18_000   # safe limit well within GPT-4o's context window
+    parts: list[str] = []
+
+    # ── 1. Board identity ──────────────────────────────────────────────────
+    if ref_content or cust_content:
+        ref_name  = (ref_content  or {}).get("board_name", "Reference Board")
+        cust_name = (cust_content or {}).get("board_name", "Customer Board")
+        soc       = (ref_content  or cust_content or {}).get("soc", "")
+        identity  = f"BOARDS UNDER ANALYSIS:\n  Reference : {ref_name}\n  Customer  : {cust_name}"
+        if soc:
+            identity += f"\n  SoC       : {soc}"
+        parts.append(identity)
+
+    # ── 2. Full comparison detail (most useful for the chatbot) ───────────
+    if comparison:
+        cmp_lines = [
+            f"COMPARISON SUMMARY: {comparison.get('summary', '')}",
+            f"Overall match: {comparison.get('overall_match_pct', 'N/A')}%",
+            "",
+            "INTERFACE-BY-INTERFACE DIFFERENCES:",
+        ]
+        for ifc in comparison.get("interfaces", []):
+            ifc_hdr = (
+                f"\n  [{ifc.get('name','?')}]  "
+                f"Match={ifc.get('match_pct','?')}%  "
+                f"Status={ifc.get('status','?')}  "
+                f"Ref signals={ifc.get('ref_signal_count','?')}  "
+                f"Cust signals={ifc.get('cust_signal_count','?')}"
+            )
+            cmp_lines.append(ifc_hdr)
+            for d in ifc.get("differences", []):
+                tag = d.get("type","")
+                sig = d.get("signal","")
+                ref_d  = d.get("ref_detail","")
+                cust_d = d.get("cust_detail","")
+                note   = d.get("notes","")
+                cmp_lines.append(
+                    f"    • [{tag}] {sig}"
+                    + (f"  REF={ref_d}"  if ref_d  else "")
+                    + (f"  CUST={cust_d}" if cust_d else "")
+                    + (f"  NOTE: {note}"  if note   else "")
+                )
+            matching = ifc.get("matching_signals", [])
+            if matching:
+                preview = ", ".join(matching[:15])
+                cmp_lines.append(
+                    f"    Matching ({len(matching)}): {preview}"
+                    + (" …" if len(matching) > 15 else "")
+                )
+        parts.append("\n".join(cmp_lines))
+
+    # ── 3. Raw signal lists per board (add as many interfaces as budget allows)
+    for label, content in [("REFERENCE BOARD SIGNALS", ref_content),
+                            ("CUSTOMER BOARD SIGNALS",  cust_content)]:
+        if not content:
+            continue
+        remaining = MAX_CHARS - sum(len(p) for p in parts)
+        if remaining < 500:
+            break
+        board_lines = [f"{label} ({content.get('board_name', '')}):"]
+        for ifc_name, signals in content.get("interfaces", {}).items():
+            chunk = f"\n  {ifc_name} ({len(signals)} signals):\n"
+            for s in signals:
+                sig_str = (
+                    f"    {s.get('signal','?')}"
+                    + (f"  dir={s.get('direction','')}"  if s.get('direction') else "")
+                    + (f"  V={s.get('voltage','')}"       if s.get('voltage')   else "")
+                    + (f"  pin={s.get('pin','')}"          if s.get('pin')       else "")
+                    + (f"  | {s.get('note','')}"           if s.get('note')      else "")
+                )
+                chunk += sig_str + "\n"
+            if sum(len(p) for p in board_lines) + len(chunk) > remaining:
+                board_lines.append(f"\n  … (remaining interfaces omitted — budget reached)")
+                break
+            board_lines.append(chunk)
+        parts.append("".join(board_lines))
+
+    if not parts:
+        return (
+            "No schematic data has been loaded yet. "
+            "Tell the user to upload and extract schematics first."
+        )
+    return "\n\n".join(parts)
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """Chatbot: answer questions using context from both schematics."""
@@ -726,49 +822,36 @@ def chat():
     sdir = get_session_dir()
     sid  = session.get("sid", "")
 
-    # Build context from extracted schematics + comparison
-    context_parts = []
-    ref_content  = load_json(os.path.join(sdir, "ref_content.json"))
-    cust_content = load_json(os.path.join(sdir, "cust_content.json"))
-    comparison   = load_json(os.path.join(sdir, "comparison.json"))
+    # Build rich, complete context from all available session data
+    schematic_context = _build_chat_context(sdir)
 
-    if ref_content:
-        context_parts.append(
-            f"REFERENCE BOARD ({ref_content.get('board_name','')}):\n"
-            + json.dumps(ref_content.get("interfaces", {}), indent=1)[:6000]
-        )
-    if cust_content:
-        context_parts.append(
-            f"CUSTOMER BOARD ({cust_content.get('board_name','')}):\n"
-            + json.dumps(cust_content.get("interfaces", {}), indent=1)[:6000]
-        )
-    if comparison:
-        context_parts.append(
-            "COMPARISON SUMMARY:\n" + comparison.get("summary", "")
-        )
+    system_prompt = f"""You are an expert hardware/electronics engineering assistant specialising in board schematics and SoC bring-up.
 
-    system_prompt = (
-        "You are a helpful hardware/electronics engineering assistant. "
-        "You have access to extracted data from two board schematics (Reference and Customer). "
-        "Answer questions about the schematics concisely and accurately. "
-        "When comparing, point out specific signals and interfaces. "
-        "If information is not in the data, say so clearly.\n\n"
-        + "\n\n".join(context_parts)
-    )
+STRICT RULES — follow these exactly:
+1. Answer ONLY based on the schematic data provided below. Do NOT invent, assume, or extrapolate signal names, voltages, pin numbers, or interface details that are not explicitly in the data.
+2. If the data does not contain enough information to answer a question, say "That information is not available in the extracted schematic data." Do not guess.
+3. When listing signals or differences, quote the exact signal names from the data.
+4. If asked about a specific interface (e.g. USB, PCIe), look up that exact interface in the data before answering.
+5. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section — it contains the authoritative diff.
+6. Be concise but complete. Use bullet points for lists.
 
-    # Retrieve / update chat history
+SCHEMATIC DATA:
+{schematic_context}"""
+
+    # Retrieve / update chat history (conversation turns only, no system prompt in history)
     history = _chat_histories.get(sid, [])
     history.append({"role": "user", "content": user_msg})
 
-    messages = [{"role": "system", "content": system_prompt}] + history[-20:]
+    # System prompt always first, then last 16 conversation turns
+    messages = [{"role": "system", "content": system_prompt}] + history[-16:]
 
     try:
         client = get_ai_client()
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            max_tokens=1024,
-            temperature=0.3,
+            max_tokens=1500,
+            temperature=0,      # zero temperature = deterministic, grounded answers
         )
         assistant_msg = resp.choices[0].message.content.strip()
         history.append({"role": "assistant", "content": assistant_msg})
