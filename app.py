@@ -167,30 +167,49 @@ def is_image_based(path: str, password: str = "") -> bool:
 
 # ── PDF Content Extraction (AI) ───────────────────────────────────────────────
 _EXTRACT_SYSTEM = """You are an expert electronics/hardware engineer analyzing board schematics.
-Extract ALL signal/pin/interface information from this schematic.
+Extract ALL information visible: signals, ICs, components, interface labels, and part numbers.
+
 Return ONLY a valid JSON object (no markdown fences) with this structure:
 {
-  "board_name": "string – inferred board/product name if visible",
-  "soc": "string – SoC/processor name if visible",
+  "board_name": "inferred board/product name if visible",
+  "soc": "SoC or main processor name and part number if visible",
+  "components": [
+    {
+      "ref_des": "U1",
+      "part_number": "CS42L43",
+      "description": "HDA/I2S Audio Codec",
+      "interface_type": "Audio",
+      "connected_via": "I2S, HDA, SoundWire"
+    }
+  ],
   "interfaces": {
-    "USB":   [ { "signal": "USB0_D+", "direction": "IO", "voltage": "3.3V", "pin": "A1", "note": "" }, ... ],
-    "PCIe":  [ ... ],
-    "DDR":   [ ... ],
-    "I2C":   [ ... ],
-    "SPI":   [ ... ],
-    "UART":  [ ... ],
-    "GPIO":  [ ... ],
-    "HDMI":  [ ... ],
-    "MIPI":  [ ... ],
-    "Power": [ ... ],
-    "Audio": [ ... ],
-    "Ethernet": [ ... ],
-    "Other": [ ... ]
+    "<EXACT_LABEL_FROM_SCHEMATIC>": [
+      {
+        "signal": "EXACT_NET_NAME",
+        "direction": "Input/Output/IO",
+        "voltage": "1.8V",
+        "pin": "A1",
+        "connected_component": "CS42L43",
+        "note": "any extra detail"
+      }
+    ]
   },
   "total_signals": 0
 }
-Include every signal you can find. Use "Other" for signals that don't fit standard interfaces.
-If a field is unknown, use an empty string "".
+
+CRITICAL RULES:
+1. COMPONENT IDENTIFICATION — scan the ENTIRE schematic for every IC, chip, and component.
+   Capture its reference designator (U1, U2, J3, etc.) and EXACT part number (CS42L43,
+   RTL8111H, SN74LVC, MAX9867, etc.). List ALL of them in the `components` array.
+   This is the MOST IMPORTANT step — never skip a component or part number.
+2. INTERFACE KEYS — use the EXACT label from the schematic block/title.
+   Include the chip name in the key where possible. Examples:
+     Good: "HDA Codec - CS42L43",  "USB 3.2 Port 0",  "GbE - RTL8111H"
+     Bad:  "Audio",  "USB",  "Ethernet"
+3. CONNECTED COMPONENT — for every signal, record which IC it connects to using the part
+   number or reference designator.
+4. SIGNAL COMPLETENESS — capture every net label, pin name, and connector signal visible.
+5. OUTPUT MUST BE COMPLETE AND VALID JSON — do not truncate.
 """
 
 def extract_schematic_content(path: str, password: str = "",
@@ -246,15 +265,24 @@ def extract_schematic_content(path: str, password: str = "",
         result = json.loads(raw)
         result["_mode"]  = "vision" if use_vision else "text"
         result["_label"] = label
+        result.setdefault("components", [])
+        # Debug logging
+        comps    = [c.get("part_number", c.get("ref_des", "?")) for c in result["components"]]
+        ifc_keys = list(result.get("interfaces", {}).keys())
+        print(f"[{label}] Components : {comps}")
+        print(f"[{label}] Interfaces : {ifc_keys}")
         return result
 
     except json.JSONDecodeError as e:
-        print(f"[{label}] JSON parse error: {e} — raw: {raw[:300]}")
-        return {"board_name": "", "soc": "", "interfaces": {}, "total_signals": 0,
-                "_mode": "error", "_label": label, "_error": str(e)}
+        snippet = raw[:500] if "raw" in dir() else ""
+        print(f"[{label}] JSON parse error: {e} — snippet: {snippet[:200]}")
+        return {"board_name": "", "soc": "", "components": [], "interfaces": {}, "total_signals": 0,
+                "_mode": "error", "_label": label,
+                "_error": f"JSON parse error: {e}",
+                "_raw_snippet": snippet[:300]}
     except Exception as e:
         print(f"[{label}] AI extraction error: {e}")
-        return {"board_name": "", "soc": "", "interfaces": {}, "total_signals": 0,
+        return {"board_name": "", "soc": "", "components": [], "interfaces": {}, "total_signals": 0,
                 "_mode": "error", "_label": label, "_error": str(e)}
 
 
@@ -737,6 +765,26 @@ def _build_chat_context(sdir: str) -> str:
             identity += f"\n  SoC       : {soc}"
         parts.append(identity)
 
+    # ── 2. Component registry — all ICs / chips found on each board ────────
+    comp_lines = ["COMPONENT REGISTRY (ICs and chips identified on each board):"]
+    for board_label, content in [("REF", ref_content), ("CUST", cust_content)]:
+        if not content:
+            continue
+        comps = content.get("components", [])
+        if comps:
+            comp_lines.append(f"  [{board_label}] {content.get('board_name','')}:")
+            for c in comps:
+                line = (f"    • {c.get('part_number', c.get('ref_des','?'))}"
+                        + (f" ({c.get('ref_des','')})"           if c.get('ref_des')        else "")
+                        + (f" — {c.get('description','')}"       if c.get('description')    else "")
+                        + (f" | Type: {c.get('interface_type','')}" if c.get('interface_type') else "")
+                        + (f" | Via: {c.get('connected_via','')}"   if c.get('connected_via')  else ""))
+                comp_lines.append(line)
+        else:
+            comp_lines.append(f"  [{board_label}] No components captured (re-extract to populate)")
+    if len(comp_lines) > 1:
+        parts.append("\n".join(comp_lines))
+
     # ── 2. Full comparison detail (most useful for the chatbot) ───────────
     if comparison:
         cmp_lines = [
@@ -846,17 +894,18 @@ def chat():
 
 STRICT RULES — follow these exactly:
 1. Answer ONLY based on the schematic data provided below.
-2. Use SEMANTIC matching when looking up interfaces. Examples:
-   - "HDA Codec" / "HD Audio" / "High Definition Audio" / "Audio Codec" all refer to the same thing.
-   - "PCIe" matches "PCI Express", "PCIe x4", "PCIe Slot 0", etc.
-   - "USB" matches "USB 3.2", "USB Port 0", "USB Type-C", etc.
-   First check the INTERFACE INDEX section to find the exact key name stored in the data,
-   then look up that key in the signal lists.
-3. When listing signals, quote the exact signal names from the data.
-4. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section.
-5. Only say "not available in the extracted data" if you have checked the ENTIRE interface
-   index and signal lists and genuinely found nothing related. Do NOT say this prematurely.
-6. Be concise but complete. Use bullet points for lists.
+2. COMPONENT LOOKUP FIRST — when asked about a chip/IC (e.g. "CS42L43", "HDA Codec",
+   "Audio Codec"), ALWAYS check the COMPONENT REGISTRY section first. It lists every
+   IC and chip found on each board with part numbers.
+3. SEMANTIC MATCHING — use broad matching for interface/chip names:
+   "HDA Codec" = "HD Audio" = "High Definition Audio" = "Audio Codec" = "I2S Codec".
+   Check both the COMPONENT REGISTRY and the INTERFACE INDEX.
+4. SIGNAL LOOKUP — use the INTERFACE INDEX to find which interface key holds the signals,
+   then look them up in the full signal lists below.
+5. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section.
+6. Only say "not in extracted data" if you have checked BOTH the component registry AND
+   all signal lists and genuinely found nothing. Never say this prematurely.
+7. Be concise but complete. Use bullet points for lists.
 
 SCHEMATIC DATA:
 {schematic_context}"""
@@ -887,6 +936,31 @@ SCHEMATIC DATA:
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/view-extracted")
+def view_extracted():
+    """Debug: return the raw extracted JSON for both boards as pretty HTML."""
+    sdir = get_session_dir()
+    html_parts = ["<html><head><title>Extracted Data Debug</title>",
+                  "<style>body{font-family:monospace;padding:1rem;background:#f8fafc}",
+                  "pre{background:#1e293b;color:#e2e8f0;padding:1.5rem;border-radius:8px;overflow-x:auto}",
+                  "h2{color:#2563eb;margin-top:1.5rem}</style></head><body>",
+                  "<h1>Extracted Schematic Data</h1>"]
+    for name, key in [("Reference Board", "ref"), ("Customer Board", "cust")]:
+        data = load_json(os.path.join(sdir, f"{key}_content.json"))
+        html_parts.append(f"<h2>{name}</h2>")
+        if data:
+            comps = data.get("components", [])
+            html_parts.append(f"<p><strong>Components found:</strong> "
+                               + (", ".join(c.get("part_number","?") for c in comps) if comps else "none") + "</p>")
+            html_parts.append(f"<p><strong>Interfaces:</strong> "
+                               + ", ".join(data.get("interfaces", {}).keys()) + "</p>")
+            html_parts.append(f"<pre>{json.dumps(data, indent=2)}</pre>")
+        else:
+            html_parts.append("<p><em>Not extracted yet.</em></p>")
+    html_parts.append("</body></html>")
+    return "\n".join(html_parts)
 
 
 @app.route("/clear-session", methods=["POST"])
