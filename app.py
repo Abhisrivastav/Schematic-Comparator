@@ -212,6 +212,72 @@ CRITICAL RULES:
 5. OUTPUT MUST BE COMPLETE AND VALID JSON — do not truncate.
 """
 
+# ── Dedicated component-scan prompt (lightweight, covers full text) ────────────
+_COMP_SCAN_SYSTEM = """You are an expert electronics engineer scanning a schematic for components.
+Your ONLY task: identify every IC, microcontroller, codec, PHY, EEPROM, crystal,
+connector, power IC, or named component visible in the text.
+
+Return ONLY a valid JSON array (no markdown fences, no extra text):
+[
+  {
+    "ref_des": "U1",
+    "part_number": "NPCK397K",
+    "manufacturer": "Nuvoton",
+    "description": "Embedded Controller",
+    "interface_type": "EC"
+  }
+]
+
+RULES:
+- List EVERY component you can identify. Completeness is critical.
+- Include microcontrollers (EC, PMC), audio codecs, USB hubs, PCIe switches, Ethernet PHYs,
+  I2C muxes, power ICs, FPGAs, CPLDs, memory ICs, display bridges, sensors, crystals.
+- If part number is unknown, still record the ref_des and any visible description.
+- Do NOT merge similar parts — list each unique ref_des separately.
+"""
+
+
+def _scan_all_components(full_text: str, client, label: str = "") -> list:
+    """
+    Dedicated component-scan pass over the FULL schematic text.
+    Splits into 30K-char chunks; runs a fast AI call per chunk.
+    Returns a merged, deduplicated list of component dicts.
+    """
+    CHUNK_SIZE = 30_000
+    chunks = [full_text[i:i + CHUNK_SIZE] for i in range(0, len(full_text), CHUNK_SIZE)]
+    all_comps: list[dict] = []
+    seen_keys: set[str] = set()
+
+    for idx, chunk in enumerate(chunks):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _COMP_SCAN_SYSTEM},
+                    {"role": "user",   "content":
+                     f"Schematic text segment {idx + 1}/{len(chunks)} ({label}):\n\n{chunk}"}
+                ],
+                max_tokens=2048,
+                temperature=0,
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+            comps = json.loads(raw)
+            if isinstance(comps, list):
+                for c in comps:
+                    key = (c.get("ref_des", "") + "|" + c.get("part_number", "")).lower()
+                    if key not in seen_keys and key != "|":
+                        seen_keys.add(key)
+                        all_comps.append(c)
+        except Exception as e:
+            print(f"[{label}] Component scan chunk {idx + 1} error: {e}")
+            continue
+
+    print(f"[{label}] Component scan: {len(all_comps)} unique components across {len(chunks)} chunk(s)")
+    return all_comps
+
+
 def extract_schematic_content(path: str, password: str = "",
                                label: str = "schematic") -> dict:
     """
@@ -221,6 +287,7 @@ def extract_schematic_content(path: str, password: str = "",
     client = get_ai_client()
     use_vision = is_image_based(path, password)
     print(f"[{label}] Mode: {'Vision' if use_vision else 'Text'}")
+    scanned_comps: list[dict] = []  # populated by component-scan pass (text mode)
 
     try:
         if use_vision:
@@ -242,10 +309,14 @@ def extract_schematic_content(path: str, password: str = "",
             ]
         else:
             text, _ = extract_text_from_pdf(path, password)
-            # Split into chunks if very long
+            # ── Pass 1: component scan over THE FULL TEXT (no chunk cap) ──
+            print(f"[{label}] Running dedicated component scan over {len(text):,} chars …")
+            scanned_comps = _scan_all_components(text, client, label)
+
+            # ── Pass 2: interface/signal extraction over first ~96K chars ──
             chunk_size = 12000
-            chunks = [text[i:i+chunk_size] for i in range(0, min(len(text), 80000), chunk_size)]
-            combined_text = "\n...\n".join(chunks[:6])
+            chunks = [text[i:i + chunk_size] for i in range(0, min(len(text), 96000), chunk_size)]
+            combined_text = "\n...\n".join(chunks[:8])
             messages = [
                 {"role": "system", "content": _EXTRACT_SYSTEM},
                 {"role": "user",   "content":
@@ -266,11 +337,24 @@ def extract_schematic_content(path: str, password: str = "",
         result["_mode"]  = "vision" if use_vision else "text"
         result["_label"] = label
         result.setdefault("components", [])
+
+        # ── Merge scanned_comps into result (text-mode only, dedup) ──────
+        if not use_vision and scanned_comps:
+            existing_keys = {
+                (c.get("ref_des", "") + "|" + c.get("part_number", "")).lower()
+                for c in result["components"]
+            }
+            for c in scanned_comps:
+                key = (c.get("ref_des", "") + "|" + c.get("part_number", "")).lower()
+                if key not in existing_keys and key != "|":
+                    existing_keys.add(key)
+                    result["components"].append(c)
+
         # Debug logging
         comps    = [c.get("part_number", c.get("ref_des", "?")) for c in result["components"]]
         ifc_keys = list(result.get("interfaces", {}).keys())
-        print(f"[{label}] Components : {comps}")
-        print(f"[{label}] Interfaces : {ifc_keys}")
+        print(f"[{label}] Components ({len(comps)}) : {comps}")
+        print(f"[{label}] Interfaces ({len(ifc_keys)}) : {ifc_keys}")
         return result
 
     except json.JSONDecodeError as e:
@@ -894,12 +978,16 @@ def chat():
 
 STRICT RULES — follow these exactly:
 1. Answer ONLY based on the schematic data provided below.
-2. COMPONENT LOOKUP FIRST — when asked about a chip/IC (e.g. "CS42L43", "HDA Codec",
-   "Audio Codec"), ALWAYS check the COMPONENT REGISTRY section first. It lists every
-   IC and chip found on each board with part numbers.
-3. SEMANTIC MATCHING — use broad matching for interface/chip names:
-   "HDA Codec" = "HD Audio" = "High Definition Audio" = "Audio Codec" = "I2S Codec".
-   Check both the COMPONENT REGISTRY and the INTERFACE INDEX.
+2. COMPONENT LOOKUP FIRST — when asked about any chip/IC/controller (e.g. "embedded controller",
+   "EC", "audio codec", "USB hub", "Ethernet PHY"), ALWAYS check the COMPONENT REGISTRY section
+   first. It lists every IC and chip found on each board with exact part numbers. Quote the
+   part number and reference designator from the registry in your answer.
+3. SEMANTIC MATCHING — map common hardware terms to their likely part types:
+   "embedded controller" = "EC" = "Nuvoton" = "ITE" = "NPCK" = "IT8" (look for EC/PMC chips)
+   "HDA Codec" = "HD Audio" = "High Definition Audio" = "audio codec" = "I2S codec" = "CS42L43"
+   "Ethernet PHY" = "GbE" = "LAN" = "RTL8" = "I210" = "88E"
+   "USB hub" = "USB mux" = "TUSB" = "GL" series
+   Search BOTH the COMPONENT REGISTRY and the INTERFACE INDEX using these aliases.
 4. SIGNAL LOOKUP — use the INTERFACE INDEX to find which interface key holds the signals,
    then look them up in the full signal lists below.
 5. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section.
