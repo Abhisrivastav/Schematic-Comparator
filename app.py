@@ -236,7 +236,7 @@ def extract_schematic_content(path: str, password: str = "",
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
@@ -716,14 +716,15 @@ def _build_chat_context(sdir: str) -> str:
     """
     Build a rich, structured system-prompt context from all available
     session data: extracted ref/cust signal lists + full comparison detail.
-    Avoids hard mid-JSON truncation by serialising each interface separately
-    and stopping cleanly when we approach the token budget.
+    Uses exact interface names as stored during extraction (e.g. "HDA Codec"
+    not a generic bucket), and includes an interface index summary so the
+    chatbot can orient itself quickly.
     """
     ref_content  = load_json(os.path.join(sdir, "ref_content.json"))
     cust_content = load_json(os.path.join(sdir, "cust_content.json"))
     comparison   = load_json(os.path.join(sdir, "comparison.json"))
 
-    MAX_CHARS = 18_000   # safe limit well within GPT-4o's context window
+    MAX_CHARS = 60_000   # GPT-4o supports 128K tokens; use 60K chars safely
     parts: list[str] = []
 
     # ── 1. Board identity ──────────────────────────────────────────────────
@@ -774,30 +775,46 @@ def _build_chat_context(sdir: str) -> str:
                 )
         parts.append("\n".join(cmp_lines))
 
-    # ── 3. Raw signal lists per board (add as many interfaces as budget allows)
-    for label, content in [("REFERENCE BOARD SIGNALS", ref_content),
-                            ("CUSTOMER BOARD SIGNALS",  cust_content)]:
+    # ── 3. Interface index — compact registry of every interface extracted ──
+    index_lines = ["INTERFACE INDEX (use this to find where signals are stored):"]
+    for board_label, content in [("REF", ref_content), ("CUST", cust_content)]:
+        if not content:
+            continue
+        for ifc_name, signals in content.get("interfaces", {}).items():
+            index_lines.append(
+                f"  [{board_label}] {ifc_name!r}  ({len(signals)} signals)"
+            )
+    if len(index_lines) > 1:
+        parts.append("\n".join(index_lines))
+
+    # ── 4. Raw signal lists per board (all interfaces, budget-aware) ──────
+    for board_label, content in [("REFERENCE BOARD SIGNALS", ref_content),
+                                  ("CUSTOMER BOARD SIGNALS",  cust_content)]:
         if not content:
             continue
         remaining = MAX_CHARS - sum(len(p) for p in parts)
-        if remaining < 500:
+        if remaining < 1000:
+            parts.append(f"[{board_label}: omitted — context budget exhausted]")
             break
-        board_lines = [f"{label} ({content.get('board_name', '')}):"]
+        board_lines = [f"{board_label} ({content.get('board_name', '')}):"]
+        used = len(board_lines[0])
         for ifc_name, signals in content.get("interfaces", {}).items():
-            chunk = f"\n  {ifc_name} ({len(signals)} signals):\n"
+            chunk_lines = [f"\n  {ifc_name!r} ({len(signals)} signals):"]
             for s in signals:
                 sig_str = (
-                    f"    {s.get('signal','?')}"
+                    f"\n    {s.get('signal','?')}"
                     + (f"  dir={s.get('direction','')}"  if s.get('direction') else "")
                     + (f"  V={s.get('voltage','')}"       if s.get('voltage')   else "")
                     + (f"  pin={s.get('pin','')}"          if s.get('pin')       else "")
                     + (f"  | {s.get('note','')}"           if s.get('note')      else "")
                 )
-                chunk += sig_str + "\n"
-            if sum(len(p) for p in board_lines) + len(chunk) > remaining:
-                board_lines.append(f"\n  … (remaining interfaces omitted — budget reached)")
+                chunk_lines.append(sig_str)
+            chunk = "".join(chunk_lines)
+            if used + len(chunk) > remaining:
+                board_lines.append(f"\n  … (remaining interfaces omitted — increase MAX_CHARS if needed)")
                 break
             board_lines.append(chunk)
+            used += len(chunk)
         parts.append("".join(board_lines))
 
     if not parts:
@@ -828,11 +845,17 @@ def chat():
     system_prompt = f"""You are an expert hardware/electronics engineering assistant specialising in board schematics and SoC bring-up.
 
 STRICT RULES — follow these exactly:
-1. Answer ONLY based on the schematic data provided below. Do NOT invent, assume, or extrapolate signal names, voltages, pin numbers, or interface details that are not explicitly in the data.
-2. If the data does not contain enough information to answer a question, say "That information is not available in the extracted schematic data." Do not guess.
-3. When listing signals or differences, quote the exact signal names from the data.
-4. If asked about a specific interface (e.g. USB, PCIe), look up that exact interface in the data before answering.
-5. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section — it contains the authoritative diff.
+1. Answer ONLY based on the schematic data provided below.
+2. Use SEMANTIC matching when looking up interfaces. Examples:
+   - "HDA Codec" / "HD Audio" / "High Definition Audio" / "Audio Codec" all refer to the same thing.
+   - "PCIe" matches "PCI Express", "PCIe x4", "PCIe Slot 0", etc.
+   - "USB" matches "USB 3.2", "USB Port 0", "USB Type-C", etc.
+   First check the INTERFACE INDEX section to find the exact key name stored in the data,
+   then look up that key in the signal lists.
+3. When listing signals, quote the exact signal names from the data.
+4. For comparison questions, use the INTERFACE-BY-INTERFACE DIFFERENCES section.
+5. Only say "not available in the extracted data" if you have checked the ENTIRE interface
+   index and signal lists and genuinely found nothing related. Do NOT say this prematurely.
 6. Be concise but complete. Use bullet points for lists.
 
 SCHEMATIC DATA:
