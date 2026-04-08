@@ -305,7 +305,7 @@ code { font-family:'Consolas','Courier New',monospace; font-size:.84em;
         <div class="status-msg" id="ref-extract-status">Not extracted yet</div>
         <div class="progress-bar"><div class="fill" id="ref-extract-progress" style="width:0"></div></div>
         <div id="ref-extract-result" class="pill-row" style="margin-top:.5rem"></div>
-        <button class="btn btn-primary" style="margin-top:.8rem" id="btn-extract-ref" onclick="runExtract('ref')">
+        <button class="btn btn-primary" style="margin-top:.8rem" id="btn-extract-ref" onclick="runExtract('ref')" disabled>
           &#x2728; Extract Reference
         </button>
       </div>
@@ -319,7 +319,7 @@ code { font-family:'Consolas','Courier New',monospace; font-size:.84em;
         <div class="status-msg" id="cust-extract-status">Not extracted yet</div>
         <div class="progress-bar"><div class="fill" id="cust-extract-progress" style="width:0"></div></div>
         <div id="cust-extract-result" class="pill-row" style="margin-top:.5rem"></div>
-        <button class="btn btn-primary" style="margin-top:.8rem;background:var(--cust-col)" id="btn-extract-cust" onclick="runExtract('cust')">
+        <button class="btn btn-primary" style="margin-top:.8rem;background:var(--cust-col)" id="btn-extract-cust" onclick="runExtract('cust')" disabled>
           &#x2728; Extract Customer
         </button>
       </div>
@@ -840,14 +840,25 @@ function escHtml(s) {
 }
 
 function updateNextButtons() {
-  const bothUploaded  = state.ref.uploaded  && state.cust.uploaded;
-  const bothExtracted = state.ref.extracted && state.cust.extracted;
+  const eitherUploaded = state.ref.uploaded  || state.cust.uploaded;
+  const bothUploaded   = state.ref.uploaded  && state.cust.uploaded;
+  const bothExtracted  = state.ref.extracted && state.cust.extracted;
 
-  document.getElementById('btn-next-extract').disabled  = !bothUploaded;
+  // Enable "Next: Extract" as soon as at least one PDF is uploaded
+  document.getElementById('btn-next-extract').disabled  = !eitherUploaded;
+  // Enable each individual extract button only when that PDF is uploaded
+  document.getElementById('btn-extract-ref').disabled   = !state.ref.uploaded;
+  document.getElementById('btn-extract-cust').disabled  = !state.cust.uploaded;
+  // Enable "Next: Compare" only when both are extracted
   document.getElementById('btn-next-compare').disabled  = !bothExtracted;
 
+  // Sidebar status labels
   if (bothUploaded) {
-    document.getElementById('nav-upload-status').textContent = '✓ Both PDFs uploaded';
+    document.getElementById('nav-upload-status').textContent = '\u2713 Both PDFs uploaded';
+    document.getElementById('nav-upload-status').className   = 'step-status ok';
+  } else if (eitherUploaded) {
+    const which = state.ref.uploaded ? 'Reference' : 'Customer';
+    document.getElementById('nav-upload-status').textContent = `\u2713 ${which} uploaded`;
     document.getElementById('nav-upload-status').className   = 'step-status ok';
   }
   if (bothExtracted) {
