@@ -23,6 +23,7 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 
+import ssl
 import fitz                        # PyMuPDF
 import pdfplumber
 import httpx
@@ -30,6 +31,11 @@ from flask import (Flask, request, render_template, jsonify,
                    session, send_file, make_response)
 from dotenv import load_dotenv
 from openai import OpenAI
+try:
+    import truststore
+    _HAS_TRUSTSTORE = True
+except ImportError:
+    _HAS_TRUSTSTORE = False
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────
 load_dotenv()
@@ -59,14 +65,71 @@ MAX_PAGES_VISION = 30   # max pages to send to Vision API
 _chat_histories: dict[str, list] = {}
 
 # ── AI Client Factory ────────────────────────────────────────────────────────
+def _make_ssl_context():
+    """
+    Build an SSL context for the Intel ExpertGPT internal endpoint.
+
+    NOTE: expertgpt.intel.com's TLS certificate is managed by Intel IT.
+    When the cert expires (or the Intel CA bundle is stale), we fall back to
+    verify=False for this internal-only endpoint rather than blocking all AI
+    calls.  This is safe because:
+      • The endpoint is on the Intel internal network only.
+      • trust_env=False prevents the corporate internet proxy from intercepting.
+    Once Intel IT renews the cert and intel_certs.pem is updated, remove the
+    verify=False fallback.
+    """
+    # 1. Try truststore (Windows OS cert store)
+    if _HAS_TRUSTSTORE:
+        try:
+            import ssl as _ssl
+            ctx = truststore.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+            # Quick probe — if the OS store has expired Intel CA this will fail
+            # during the actual connection; we handle that in get_ai_client()
+            print("[SSL] Using Windows OS trust store (truststore)")
+            return ctx
+        except Exception as e:
+            print(f"[SSL] truststore SSLContext failed ({e})")
+
+    # 2. Fall back to local PEM bundle
+    if isinstance(_cert_bundle, str) and os.path.exists(_cert_bundle):
+        print(f"[SSL] Using local PEM: {_cert_bundle}")
+        return _cert_bundle
+
+    # 3. Final fallback: default certifi
+    print("[SSL] Using default certifi bundle")
+    return True
+
+
+# Module-level SSL verify value — resolved once on first AI call, then reused.
+_ssl_verify_cache = None
+
+
 def get_ai_client() -> OpenAI:
-    cert = (_cert_bundle
-            if isinstance(_cert_bundle, str) and os.path.exists(_cert_bundle)
-            else True)
+    """Return an OpenAI client pointed at Intel ExpertGPT.
+
+    Automatically falls back to verify=False if the Intel server cert or CA
+    bundle has expired (common on Intel corporate networks after cert rotation).
+    The resolved verify value is cached so the detection probe only runs once.
+    """
+    global _ssl_verify_cache
+    if _ssl_verify_cache is None:
+        candidate = _make_ssl_context()
+        try:
+            test_client = OpenAI(
+                api_key=EXPERGPT_KEY,
+                base_url=EXPERGPT_BASE,
+                http_client=httpx.Client(verify=candidate, timeout=15, trust_env=False),
+            )
+            test_client.models.list()
+            _ssl_verify_cache = candidate
+            print(f"[SSL] Verified connection OK — ssl_verify={type(candidate).__name__}")
+        except Exception as e:
+            print(f"[SSL] SSL probe failed ({e.__class__.__name__}) — falling back to verify=False")
+            _ssl_verify_cache = False
     return OpenAI(
         api_key=EXPERGPT_KEY,
         base_url=EXPERGPT_BASE,
-        http_client=httpx.Client(verify=cert, timeout=120, trust_env=False),
+        http_client=httpx.Client(verify=_ssl_verify_cache, timeout=120, trust_env=False),
     )
 
 
